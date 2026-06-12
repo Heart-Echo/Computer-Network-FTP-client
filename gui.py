@@ -35,6 +35,9 @@ class FTPClientGUI:
         self.transfer_active = False
         self.transfer_paused = False
         self.current_transfer_id = None
+        self.current_transfer_type = None  # 'upload' 或 'download'
+        self.current_transfer_params = {}  # 恢复传输所需的参数
+        self.last_progress_bytes = 0  # 上次进度回调的字节数
 
         # 设置主题样式
         self._setup_styles()
@@ -361,7 +364,7 @@ class FTPClientGUI:
         """显示连接对话框"""
         dialog = tk.Toplevel(self.root)
         dialog.title("连接到FTP服务器")
-        dialog.geometry("450x380")
+        dialog.geometry("450x420")
         dialog.resizable(False, False)
         dialog.transient(self.root)
         dialog.grab_set()
@@ -369,7 +372,7 @@ class FTPClientGUI:
         # 居中显示
         dialog.update_idletasks()
         x = self.root.winfo_x() + (self.root.winfo_width() - 450) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - 380) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 420) // 2
         dialog.geometry(f"+{x}+{y}")
 
         main_frame = ttk.Frame(dialog, padding=(20, 20))
@@ -413,12 +416,9 @@ class FTPClientGUI:
             if anon_var.get():
                 user_var.set("anonymous")
                 pass_var.set("")
-                user_entry.config(state=tk.DISABLED)
-                pass_entry.config(state=tk.DISABLED)
             else:
                 user_var.set("")
-                user_entry.config(state=tk.NORMAL)
-                pass_entry.config(state=tk.NORMAL)
+                pass_var.set("")
 
         ttk.Checkbutton(main_frame, text="匿名登录", variable=anon_var,
                         command=toggle_anon).pack(anchor=tk.W, pady=(10, 0))
@@ -428,6 +428,11 @@ class FTPClientGUI:
         passive_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(main_frame, text="使用被动模式 (PASV)",
                         variable=passive_var).pack(anchor=tk.W, pady=(5, 0))
+
+        # TLS加密复选框
+        tls_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(main_frame, text="启用TLS加密 (AUTH TLS)",
+                        variable=tls_var).pack(anchor=tk.W, pady=(5, 0))
 
         # 消息标签
         msg_var = tk.StringVar()
@@ -478,6 +483,16 @@ class FTPClientGUI:
 
                 # 设置模式
                 self.ftp.set_passive_mode(passive_var.get())
+
+                # 启用TLS（如果需要）
+                if tls_var.get():
+                    tls_ok, tls_msg = self.ftp.enable_tls()
+                    if not tls_ok:
+                        dialog.after(0, lambda: [
+                            msg_var.set(f"TLS失败: {tls_msg}"),
+                            connect_btn.config(state=tk.NORMAL, text="连接")
+                        ])
+                        return
 
                 dialog.after(0, lambda: self._on_connected(host, port, username))
                 dialog.after(0, dialog.destroy)
@@ -962,61 +977,71 @@ class FTPClientGUI:
 
     # ==================== 上传下载 ====================
 
-    def _upload_file(self):
+    def _upload_file(self, resume=False):
         """上传文件"""
         if not self.is_connected:
             messagebox.showinfo("提示", "请先连接到FTP服务器")
             return
 
-        selection = self.local_tree.selection()
-        if selection:
-            item = selection[0]
-            values = self.local_tree.item(item, "values")
-            name = values[0].rstrip('/')
-            if name == "..":
-                local_path = ""
-            else:
-                local_path = os.path.join(self.current_local_path, name)
+        if resume:
+            # 恢复模式：使用保存的参数
+            params = self.current_transfer_params
+            local_path = params.get("local_path", "")
+            remote_filename = params.get("remote_filename", "")
+            file_size = params.get("file_size", 0)
+            transfer_id = self.current_transfer_id
         else:
-            local_path = filedialog.askopenfilename(
-                initialdir=self.current_local_path,
-                title="选择要上传的文件"
+            selection = self.local_tree.selection()
+            if selection:
+                item = selection[0]
+                values = self.local_tree.item(item, "values")
+                name = values[0].rstrip('/')
+                if name == "..":
+                    local_path = ""
+                else:
+                    local_path = os.path.join(self.current_local_path, name)
+            else:
+                local_path = filedialog.askopenfilename(
+                    initialdir=self.current_local_path,
+                    title="选择要上传的文件"
+                )
+
+            if not local_path or not os.path.exists(local_path):
+                return
+
+            if os.path.isdir(local_path):
+                messagebox.showwarning("提示", "暂不支持上传整个目录")
+                return
+
+            remote_filename = os.path.basename(local_path)
+            file_size = os.path.getsize(local_path)
+
+            # 创建传输记录
+            transfer_id = self.db.add_transfer_record(
+                self.connection_id, "upload", remote_filename, local_path, file_size
             )
+            # 保存参数以支持恢复
+            self.current_transfer_type = "upload"
+            self.current_transfer_params = {
+                "local_path": local_path,
+                "remote_filename": remote_filename,
+                "file_size": file_size,
+            }
 
-        if not local_path or not os.path.exists(local_path):
-            return
-
-        if os.path.isdir(local_path):
-            messagebox.showwarning("提示", "暂不支持上传整个目录")
-            return
-
-        remote_filename = os.path.basename(local_path)
-        file_size = os.path.getsize(local_path)
-
-        # 检查是否需要断点续传
-        resume = False
-        # 可以检查数据库中的记录来判断
-
-        # 创建传输记录
-        transfer_id = self.db.add_transfer_record(
-            self.connection_id, "upload", remote_filename, local_path, file_size
-        )
         self.current_transfer_id = transfer_id
-
         self.transfer_active = True
         self.transfer_paused = False
         self.pause_btn.config(state=tk.NORMAL)
         self.resume_btn.config(state=tk.DISABLED)
-
-        progress_event = threading.Event()
+        self.last_progress_bytes = 0
 
         def progress_callback(bytes_sent, total_bytes):
-            if not progress_event.is_set():
-                percent = (bytes_sent / total_bytes) * 100 if total_bytes > 0 else 0
-                self.root.after(0, lambda: self._update_progress(
-                    percent, f"上传中... {self.db.format_bytes(bytes_sent)} / {self.db.format_bytes(total_bytes)}"
-                ))
-                self.root.after(0, lambda: self.db.update_transfer_progress(transfer_id, bytes_sent))
+            self.last_progress_bytes = bytes_sent
+            percent = (bytes_sent / total_bytes) * 100 if total_bytes > 0 else 0
+            self.root.after(0, lambda: self._update_progress(
+                percent, f"上传中... {self.db.format_bytes(bytes_sent)} / {self.db.format_bytes(total_bytes)}"
+            ))
+            self.root.after(0, lambda: self.db.update_transfer_progress(transfer_id, bytes_sent))
 
         def do_upload():
             success, message = self.ftp.upload_file(
@@ -1025,77 +1050,100 @@ class FTPClientGUI:
 
             def finish():
                 self.transfer_active = False
+                p_was_paused = self.transfer_paused
                 self.transfer_paused = False
                 self.pause_btn.config(state=tk.DISABLED)
                 self.resume_btn.config(state=tk.DISABLED)
 
                 if success:
-                    self.db.complete_transfer(transfer_id, file_size if success else 0)
+                    self.db.complete_transfer(transfer_id, file_size)
                     self._update_progress(100, f"上传完成: {remote_filename}")
                     self._refresh_remote()
+                    self.current_transfer_id = None
                     messagebox.showinfo("上传完成", message)
+                elif p_was_paused:
+                    # 传输被用户暂停 → 保存断点并保持 paused 状态
+                    self.db.pause_transfer(transfer_id, self.last_progress_bytes)
+                    self.transfer_paused = True  # 恢复 paused 标志
+                    self.resume_btn.config(state=tk.NORMAL)
+                    self._set_status(f"上传已暂停 (已传输 {self.db.format_bytes(self.last_progress_bytes)})")
                 else:
                     self.db.fail_transfer(transfer_id)
+                    self.current_transfer_id = None
                     self._set_status(f"上传失败: {message}")
                     messagebox.showerror("上传失败", message)
-
-                self.current_transfer_id = None
 
             self.root.after(0, finish)
 
         threading.Thread(target=do_upload, daemon=True).start()
 
-    def _download_file(self):
+    def _download_file(self, resume=False):
         """下载文件"""
         if not self.is_connected:
             messagebox.showinfo("提示", "请先连接到FTP服务器")
             return
 
-        selection = self.remote_tree.selection()
-        if not selection:
-            messagebox.showinfo("提示", "请选择要下载的远程文件")
-            return
+        if resume:
+            # 恢复模式：使用保存的参数
+            params = self.current_transfer_params
+            remote_name = params.get("remote_name", "")
+            local_path = params.get("local_path", "")
+            transfer_id = self.current_transfer_id
+        else:
+            selection = self.remote_tree.selection()
+            if not selection:
+                messagebox.showinfo("提示", "请选择要下载的远程文件")
+                return
 
-        item = selection[0]
-        values = self.remote_tree.item(item, "values")
-        remote_name = values[0].rstrip('/')
-        if remote_name == "..":
-            return
+            item = selection[0]
+            values = self.remote_tree.item(item, "values")
+            remote_name = values[0].rstrip('/')
+            if remote_name == "..":
+                return
 
-        item_type = values[1] if len(values) > 1 else ""
-        if item_type == "目录" or "<DIR>" in item_type:
-            messagebox.showwarning("提示", "暂不支持下载整个目录")
-            return
+            item_type = values[1] if len(values) > 1 else ""
+            if item_type == "目录" or "<DIR>" in item_type:
+                messagebox.showwarning("提示", "暂不支持下载整个目录")
+                return
 
-        # 选择本地保存路径
-        local_path = filedialog.asksaveasfilename(
-            initialdir=self.current_local_path,
-            initialfile=remote_name,
-            title="保存下载文件到"
-        )
-        if not local_path:
-            return
+            # 选择本地保存路径
+            local_path = filedialog.asksaveasfilename(
+                initialdir=self.current_local_path,
+                initialfile=remote_name,
+                title="保存下载文件到"
+            )
+            if not local_path:
+                return
 
-        # 检查是否需要断点续传
-        resume = False
-        if os.path.exists(local_path):
-            local_size = os.path.getsize(local_path)
-            resume = messagebox.askyesno("断点续传",
-                                         f"文件 {local_path} 已存在 ({self.db.format_bytes(local_size)})。\n"
-                                         f"是否使用断点续传继续下载？")
+            # 检查是否需要断点续传
+            if os.path.exists(local_path):
+                local_size = os.path.getsize(local_path)
+                if local_size > 0:
+                    if messagebox.askyesno("断点续传",
+                                           f"文件 {local_path} 已存在 ({self.db.format_bytes(local_size)})。\n"
+                                           f"是否使用断点续传继续下载？"):
+                        resume = True
 
-        # 创建传输记录
-        transfer_id = self.db.add_transfer_record(
-            self.connection_id, "download", remote_name, local_path, 0
-        )
+            # 创建传输记录
+            transfer_id = self.db.add_transfer_record(
+                self.connection_id, "download", remote_name, local_path, 0
+            )
+            # 保存参数以支持恢复
+            self.current_transfer_type = "download"
+            self.current_transfer_params = {
+                "remote_name": remote_name,
+                "local_path": local_path,
+            }
+
         self.current_transfer_id = transfer_id
-
         self.transfer_active = True
         self.transfer_paused = False
         self.pause_btn.config(state=tk.NORMAL)
         self.resume_btn.config(state=tk.DISABLED)
+        self.last_progress_bytes = 0
 
         def progress_callback(bytes_downloaded, total_bytes):
+            self.last_progress_bytes = bytes_downloaded
             percent = (bytes_downloaded / total_bytes) * 100 if total_bytes > 0 else 0
             self.root.after(0, lambda: self._update_progress(
                 percent, f"下载中... {self.db.format_bytes(bytes_downloaded)} / {self.db.format_bytes(total_bytes)}"
@@ -1109,6 +1157,7 @@ class FTPClientGUI:
 
             def finish():
                 self.transfer_active = False
+                p_was_paused = self.transfer_paused
                 self.transfer_paused = False
                 self.pause_btn.config(state=tk.DISABLED)
                 self.resume_btn.config(state=tk.DISABLED)
@@ -1118,13 +1167,19 @@ class FTPClientGUI:
                     self.db.complete_transfer(transfer_id, final_size)
                     self._update_progress(100, f"下载完成: {remote_name}")
                     self._refresh_local()
+                    self.current_transfer_id = None
                     messagebox.showinfo("下载完成", message)
+                elif p_was_paused:
+                    # 传输被用户暂停 → 保存断点并保持 paused 状态
+                    self.db.pause_transfer(transfer_id, self.last_progress_bytes)
+                    self.transfer_paused = True  # 恢复 paused 标志
+                    self.resume_btn.config(state=tk.NORMAL)
+                    self._set_status(f"下载已暂停 (已传输 {self.db.format_bytes(self.last_progress_bytes)})")
                 else:
                     self.db.fail_transfer(transfer_id)
+                    self.current_transfer_id = None
                     self._set_status(f"下载失败: {message}")
                     messagebox.showerror("下载失败", message)
-
-                self.current_transfer_id = None
 
             self.root.after(0, finish)
 
@@ -1135,24 +1190,30 @@ class FTPClientGUI:
         if not self.transfer_active or self.transfer_paused:
             return
         self.transfer_paused = True
+        self.ftp.pause_transfer()
         self.pause_btn.config(state=tk.DISABLED)
         self.resume_btn.config(state=tk.NORMAL)
-
-        if self.current_transfer_id:
-            # 获取当前进度并保存
-            current_bytes = int(self.progress_var.get() * 100)  # 实际需要精确值
-            # self.db.pause_transfer(self.current_transfer_id, current_bytes)
-
-        self._set_status("传输已暂停")
+        self._set_status("正在暂停传输...")
 
     def _resume_transfer(self):
-        """继续传输"""
+        """继续传输（重新启动传输线程）"""
         if not self.transfer_paused:
             return
-        self.transfer_paused = False
+        if not self.is_connected:
+            messagebox.showwarning("提示", "连接已断开，无法继续传输")
+            return
+
         self.pause_btn.config(state=tk.NORMAL)
         self.resume_btn.config(state=tk.DISABLED)
-        self._set_status("传输已继续")
+
+        if self.current_transfer_type == "download":
+            self._set_status("正在恢复下载...")
+            self._download_file(resume=True)
+        elif self.current_transfer_type == "upload":
+            self._set_status("正在恢复上传...")
+            self._upload_file(resume=True)
+        else:
+            self._set_status("无法确定传输类型，无法恢复")
 
     def _cancel_transfer(self):
         """取消传输"""

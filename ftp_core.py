@@ -1,9 +1,9 @@
-"""
-FTP核心协议模块 - 使用Socket编程实现FTP协议
+﻿"""FTP核心协议模块 - 使用Socket编程实现FTP协议 (支持FTPS)
 按照RFC 959规范实现FTP客户端功能
 支持主动模式(PORT)和被动模式(PASV)、断点续传(REST)
 """
 
+import ssl
 import socket
 import os
 import re
@@ -12,7 +12,7 @@ from typing import Optional, Tuple, List
 
 
 class FTPClient:
-    """FTP客户端核心类 - 从创建socket、建立TCP连接开始实现FTP协议"""
+    """FTP客户端核心类 - 从创建Socket、建立TCP连接开始实现FTP协议"""
 
     def __init__(self):
         self.control_socket: Optional[socket.socket] = None
@@ -25,7 +25,10 @@ class FTPClient:
         self.is_logged_in: bool = False
         self.is_passive: bool = True  # 默认被动模式
         self.timeout: int = 30
+        self.tls_enabled: bool = False  # TLS/SSL 是否已启用
         self.buffer_size: int = 8192
+        self.transfer_paused: bool = False  # 传输暂停标志
+        self.last_transferred_bytes: int = 0  # 暂停时已传输的字节数
 
     # ==================== Socket连接管理 ====================
 
@@ -94,6 +97,7 @@ class FTPClient:
         self.is_logged_in = False
         self.host = ""
         self.username = ""
+        self.tls_enabled = False
 
     # ==================== FTP认证 ====================
 
@@ -112,13 +116,29 @@ class FTPClient:
         # 发送USER命令
         success, response = self._send_command(f"USER {username}")
         if not success:
-            return False, f"USER命令失败: {response}"
+            # 自动检测：如果服务器要求AUTH TLS，尝试启用TLS后重试
+            if "503" in response and "AUTH" in response.upper():
+                tls_ok, tls_msg = self.enable_tls()
+                if not tls_ok:
+                    return False, f"服务器要求TLS但启用失败: {tls_msg}"
+                success, response = self._send_command(f"USER {username}")
+                if not success:
+                    return False, f"USER命令在TLS后仍失败: {response}"
+            else:
+                return False, f"USER命令失败: {response}"
 
         # 如果返回230，说明无需密码（匿名登录）
         if response.startswith("230"):
             self.username = username
             self.is_logged_in = True
             return True, response
+
+        # 服务器要求先AUTH TLS
+        if response.startswith("503"):
+            tls_ok, tls_msg = self.enable_tls()
+            if not tls_ok:
+                return False, f"服务器要求TLS但启用失败: {tls_msg}"
+            return self.login(username, password)
 
         # 需要密码，发送PASS命令
         if response.startswith("331"):
@@ -133,6 +153,55 @@ class FTPClient:
         else:
             return False, response
 
+    # ==================== FTPS (TLS/SSL) ====================
+
+    def enable_tls(self) -> Tuple[bool, str]:
+        """
+        启用TLS/SSL加密 (AUTH TLS)
+        FTP over TLS (FTPS) - 加密控制通道和数据通道
+        """
+        if not self.control_socket:
+            return False, "未连接到FTP服务器"
+        if self.tls_enabled:
+            return True, "TLS已启用"
+
+        success, response = self._send_command("AUTH TLS")
+        if not success or not response.startswith("234"):
+            return False, f"AUTH TLS失败: {response}"
+
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        try:
+            self.control_socket = context.wrap_socket(
+                self.control_socket,
+                server_hostname=self.host,
+                do_handshake_on_connect=True
+            )
+        except ssl.SSLError as e:
+            return False, f"SSL握手失败: {e}"
+        except OSError as e:
+            return False, f"TLS协商失败: {e}"
+
+        self.tls_enabled = True
+        self._send_command("PBSZ 0")
+        self._send_command("PROT P")
+        return True, "TLS加密已启用"
+
+    def _wrap_socket_tls(self, sock: socket.socket) -> socket.socket:
+        """用TLS包裹socket (用于数据通道)"""
+        if not self.tls_enabled:
+            return sock
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        try:
+            return context.wrap_socket(
+                sock, server_hostname=self.host, do_handshake_on_connect=True
+            )
+        except Exception:
+            return sock
+
     # ==================== FTP命令实现 ====================
 
     def cwd(self, directory: str) -> Tuple[bool, str]:
@@ -144,7 +213,6 @@ class FTPClient:
         """获取当前工作目录 (PWD)"""
         success, response = self._send_command("PWD")
         if success and response.startswith("257"):
-            # 解析路径 (如 "257 \"/path\" is the current directory")
             match = re.search(r'"([^"]*)"', response)
             if match:
                 return True, match.group(1)
@@ -159,10 +227,6 @@ class FTPClient:
         """
         列出目录内容 (LIST)
         使用数据连接获取目录列表
-        参数:
-            path: 要列出的路径（空字符串表示当前目录）
-        返回:
-            (成功标志, 文件/目录名列表)
         """
         if not self._setup_data_connection():
             return False, ["无法建立数据连接"]
@@ -180,29 +244,22 @@ class FTPClient:
 
         data = self._receive_data()
         self._close_data_connection()
-
-        # 读取传输完成响应
         self._receive_response()
 
         if not data:
             return True, []
 
-        # 解析LIST输出，提取文件名（Unix格式: "drwxr-xr-x ... name"）
-        lines = data.strip().split('\n')
+        lines = data.strip().split("\n")
         file_names = []
         for line in lines:
             line = line.strip()
             if not line:
                 continue
-            # Unix LIST格式: 权限 链接数 所有者 组 大小 月 日 时间/年 文件名
-            # Windows IIS格式: 月-日-年 时间 ... 文件名
             parts = line.split()
             if len(parts) >= 9:
-                # Unix格式：文件名从第9列开始
-                name = ' '.join(parts[8:])
+                name = " ".join(parts[8:])
                 file_names.append(name)
             elif len(parts) >= 4:
-                # Windows格式或其他格式：取最后一列
                 name = parts[-1]
                 file_names.append(name)
             else:
@@ -211,10 +268,7 @@ class FTPClient:
         return True, file_names
 
     def list_dir_raw(self, path: str = "") -> Tuple[bool, str]:
-        """
-        列出目录原始内容（用于判断文件/目录类型）
-        返回原始LIST输出字符串
-        """
+        """列出目录原始内容（用于判断文件/目录类型）"""
         if not self._setup_data_connection():
             return False, "无法建立数据连接"
 
@@ -232,10 +286,7 @@ class FTPClient:
         return True, data if data else ""
 
     def get_file_size(self, filename: str) -> Tuple[bool, int]:
-        """
-        获取远程文件大小 (SIZE)
-        用于断点续传时确定文件总大小
-        """
+        """获取远程文件大小 (SIZE)"""
         success, response = self._send_command(f"SIZE {filename}")
         if success and response.startswith("213"):
             try:
@@ -246,24 +297,12 @@ class FTPClient:
         return False, 0
 
     def set_restart_marker(self, offset: int) -> Tuple[bool, str]:
-        """
-        设置断点续传位置 (REST)
-        参数:
-            offset: 从哪个字节位置开始传输
-        返回:
-            (成功标志, 响应消息)
-        """
+        """设置断点续传位置 (REST)"""
         success, response = self._send_command(f"REST {offset}")
         return success and response.startswith("350"), response
 
     def set_type(self, type_char: str = "I") -> Tuple[bool, str]:
-        """
-        设置传输类型 (TYPE)
-        参数:
-            type_char: 'A' (ASCII) 或 'I' (Binary/Image)
-        返回:
-            (成功标志, 响应消息)
-        """
+        """设置传输类型 (TYPE)"""
         success, response = self._send_command(f"TYPE {type_char}")
         return success and response.startswith("200"), response
 
@@ -271,44 +310,38 @@ class FTPClient:
         """切换主动/被动模式"""
         self.is_passive = passive
 
+    def pause_transfer(self):
+        """暂停当前传输 - 线程安全"""
+        self.transfer_paused = True
+
+    def resume_transfer(self):
+        """恢复暂停的传输"""
+        self.transfer_paused = False
+
     def download_file(self, remote_file: str, local_path: str,
                       progress_callback=None, resume: bool = False) -> Tuple[bool, str]:
-        """
-        下载文件 (RETR)
-        支持断点续传
-        参数:
-            remote_file: 远程文件名
-            local_path: 本地保存路径
-            progress_callback: 进度回调函数 callback(bytes_downloaded, total_bytes)
-            resume: 是否使用断点续传
-        返回:
-            (成功标志, 消息)
-        """
+        """下载文件 (RETR) - 支持断点续传和暂停"""
         try:
-            # 设置二进制传输模式
+            self.transfer_paused = False
+            self.last_transferred_bytes = 0
             self.set_type("I")
-
-            # 获取远程文件大小
             get_size_ok, remote_size = self.get_file_size(remote_file)
 
-            # 处理断点续传
             local_size = 0
             if resume and os.path.exists(local_path):
                 local_size = os.path.getsize(local_path)
-                self.set_restart_marker(local_size)
+                if local_size > 0:
+                    self.set_restart_marker(local_size)
 
-            # 建立数据连接
             if not self._setup_data_connection():
                 return False, "无法建立数据连接"
 
-            # 发送RETR命令
             success, response = self._send_command(f"RETR {remote_file}")
 
             if not success or (not response.startswith("150") and not response.startswith("125")):
                 self._close_data_connection()
                 return False, f"下载请求失败: {response}"
 
-            # 接收数据
             mode = "ab" if (resume and local_size > 0) else "wb"
             total_bytes = local_size
             total_size = local_size + remote_size if remote_size > 0 else 0
@@ -316,24 +349,38 @@ class FTPClient:
             try:
                 with open(local_path, mode) as f:
                     while True:
-                        chunk = self.data_socket.recv(self.buffer_size)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        total_bytes += len(chunk)
-                        if progress_callback and total_size > 0:
-                            progress_callback(total_bytes, total_size)
+                        # 检查暂停标志
+                        if self.transfer_paused:
+                            self.last_transferred_bytes = total_bytes
+                            self._close_data_connection()
+                            return False, "TRANSPORT_PAUSED"
+
+                        try:
+                            self.data_socket.settimeout(1)
+                            chunk = self.data_socket.recv(self.buffer_size)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            total_bytes += len(chunk)
+                            if progress_callback and total_size > 0:
+                                progress_callback(total_bytes, total_size)
+                        except socket.timeout:
+                            # 超时后继续循环，检查暂停标志
+                            continue
             except socket.timeout:
                 pass
 
             self._close_data_connection()
-
-            # 读取传输完成响应
             final_response = self._receive_response()
 
             if final_response.startswith("226") or final_response.startswith("250"):
                 if progress_callback and total_size > 0:
                     progress_callback(total_bytes, total_size)
+                # 验证文件完整性：比对本地文件大小与远程文件大小
+                if remote_size > 0 and os.path.exists(local_path):
+                    actual_local_size = os.path.getsize(local_path)
+                    if actual_local_size != remote_size:
+                        return False, f"下载可能不完整: 本地 {actual_local_size} 字节，远程 {remote_size} 字节"
                 return True, f"下载完成: {remote_file} ({total_bytes} 字节)"
             else:
                 return False, f"传输可能不完整: {final_response}"
@@ -344,31 +391,18 @@ class FTPClient:
 
     def upload_file(self, local_path: str, remote_filename: str,
                     progress_callback=None, resume: bool = False) -> Tuple[bool, str]:
-        """
-        上传文件 (STOR)
-        支持断点续传
-        参数:
-            local_path: 本地文件路径
-            remote_filename: 远程文件名
-            progress_callback: 进度回调函数 callback(bytes_uploaded, total_bytes)
-            resume: 是否使用断点续传
-        返回:
-            (成功标志, 消息)
-        """
+        """上传文件 (STOR) - 支持断点续传和暂停"""
         try:
             if not os.path.exists(local_path):
                 return False, f"本地文件不存在: {local_path}"
 
-            # 设置二进制传输模式
+            self.transfer_paused = False
+            self.last_transferred_bytes = 0
             self.set_type("I")
-
-            # 获取本地文件大小
             total_size = os.path.getsize(local_path)
 
-            # 处理断点续传
             offset = 0
             if resume:
-                # 检查远程文件大小
                 get_size_ok, remote_size = self.get_file_size(remote_filename)
                 if get_size_ok and remote_size < total_size:
                     offset = remote_size
@@ -376,24 +410,26 @@ class FTPClient:
                 elif get_size_ok and remote_size >= total_size:
                     return False, "远程文件已完整，无需续传"
 
-            # 建立数据连接
             if not self._setup_data_connection():
                 return False, "无法建立数据连接"
 
-            # 发送STOR命令
             success, response = self._send_command(f"STOR {remote_filename}")
 
             if not success or (not response.startswith("150") and not response.startswith("125")):
-                self._close_data_connection()
                 return False, f"上传请求失败: {response}"
 
-            # 发送数据
             bytes_sent = offset
             try:
                 with open(local_path, "rb") as f:
                     if offset > 0:
                         f.seek(offset)
                     while True:
+                        # 检查暂停标志
+                        if self.transfer_paused:
+                            self.last_transferred_bytes = bytes_sent
+                            self._close_data_connection()
+                            return False, "TRANSPORT_PAUSED"
+
                         chunk = f.read(self.buffer_size)
                         if not chunk:
                             break
@@ -406,8 +442,6 @@ class FTPClient:
                 return False, f"数据传输失败: {str(e)}"
 
             self._close_data_connection()
-
-            # 读取传输完成响应
             final_response = self._receive_response()
 
             if final_response.startswith("226") or final_response.startswith("250"):
@@ -456,22 +490,13 @@ class FTPClient:
     # ==================== 内部方法：命令发送与响应接收 ====================
 
     def _send_command(self, command: str) -> Tuple[bool, str]:
-        """
-        向服务器发送FTP命令并接收响应
-        参数:
-            command: FTP命令字符串
-        返回:
-            (成功标志, 响应消息)
-        """
+        """向服务器发送FTP命令并接收响应"""
         if not self.control_socket:
             return False, "未连接到服务器"
 
         try:
-            # 发送命令（FTP命令以CRLF结束）
             cmd_bytes = (command + "\r\n").encode("utf-8", errors="ignore")
             self.control_socket.sendall(cmd_bytes)
-
-            # 接收响应
             response = self._receive_response()
             return True, response
 
@@ -481,19 +506,11 @@ class FTPClient:
             return False, f"发送失败: {str(e)}"
 
     def _receive_response(self) -> str:
-        """
-        接收FTP控制连接的响应
-        FTP响应可能是单行或多行（多行响应的格式: 三位状态码-内容，最后一行: 三位状态码 内容）
-        返回:
-            完整的响应字符串
-        """
+        """接收FTP控制连接的响应"""
         try:
             response = self.control_socket.recv(self.buffer_size).decode("utf-8", errors="ignore")
-            # 处理多行响应
             while True:
-                # 检查是否是单行响应 或 多行响应的最后一行
-                # FTP响应格式: "NNN text" (单行) 或 "NNN-text" 开始，"NNN text" 结束(多行)
-                if len(response) >= 4 and response[3] == ' ':
+                if len(response) >= 4 and response[3] == " ":
                     break
                 try:
                     self.control_socket.settimeout(1)
@@ -516,12 +533,7 @@ class FTPClient:
     # ==================== 内部方法：数据连接管理 ====================
 
     def _setup_data_connection(self) -> bool:
-        """
-        建立数据连接
-        支持主动模式(PORT)和被动模式(PASV)
-        返回:
-            成功标志
-        """
+        """建立数据连接 - 支持主动模式(PORT)和被动模式(PASV)"""
         self._close_data_connection()
         self._close_listen_socket()
 
@@ -531,18 +543,14 @@ class FTPClient:
             return self._setup_active_data_connection()
 
     def _setup_passive_data_connection(self) -> bool:
-        """
-        被动模式(PASV) - 服务器监听，客户端连接
-        发送PASV命令，服务器返回IP和端口，客户端建立数据连接
-        """
+        """被动模式(PASV) - 服务器监听，客户端连接"""
         try:
             success, response = self._send_command("PASV")
             if not success or not response.startswith("227"):
                 return False
 
-            # 解析被动模式地址 (如 "227 Entering Passive Mode (127,0,0,1,195,80)")
             match = re.search(
-                r'(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)',
+                r"(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)",
                 response
             )
             if not match:
@@ -552,10 +560,12 @@ class FTPClient:
             data_host = f"{h1}.{h2}.{h3}.{h4}"
             data_port = p1 * 256 + p2
 
-            # 创建数据socket并连接
             self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.data_socket.settimeout(self.timeout)
             self.data_socket.connect((data_host, data_port))
+
+            if self.tls_enabled:
+                self.data_socket = self._wrap_socket_tls(self.data_socket)
 
             return True
 
@@ -564,29 +574,19 @@ class FTPClient:
             return False
 
     def _setup_active_data_connection(self) -> bool:
-        """
-        主动模式(PORT) - 客户端监听，服务器连接
-        客户端发送PORT命令告知服务器自己的IP和端口
-        服务器主动连接客户端的数据端口
-        """
+        """主动模式(PORT) - 客户端监听，服务器连接"""
         try:
-            # 创建监听socket
             self.data_listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.data_listen_socket.settimeout(self.timeout)
-            # 绑定到0.0.0.0:0，让系统分配一个可用端口
-            self.data_listen_socket.bind(('0.0.0.0', 0))
+            self.data_listen_socket.bind(("0.0.0.0", 0))
             self.data_listen_socket.listen(1)
 
-            # 获取分配的端口
             listen_port = self.data_listen_socket.getsockname()[1]
-
-            # 获取本机IP（通过控制连接socket）
             local_ip = self.control_socket.getsockname()[0]
-            ip_parts = local_ip.replace('.', ',')
+            ip_parts = local_ip.replace(".", ",")
             port_high = listen_port // 256
             port_low = listen_port % 256
 
-            # 发送PORT命令
             success, response = self._send_command(f"PORT {ip_parts},{port_high},{port_low}")
             if not success or not response.startswith("200"):
                 self._close_listen_socket()
@@ -604,10 +604,11 @@ class FTPClient:
         if self.is_passive:
             sock = self.data_socket
         else:
-            # 主动模式：等待服务器连接
             try:
                 self.data_socket, addr = self.data_listen_socket.accept()
                 self.data_socket.settimeout(self.timeout)
+                if self.tls_enabled:
+                    self.data_socket = self._wrap_socket_tls(self.data_socket)
                 sock = self.data_socket
             except socket.timeout:
                 return ""
